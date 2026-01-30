@@ -1,0 +1,14 @@
+spreadsheet column,location,field name,
+Grant Number,Post: Grant ,grant_number,
+Program Name,Taxonomy: Grant Program,Term,see taxonomymapping.csv
+Organization Name,Post: Grant ,title,
+City,Post: Grant ,city,
+State,Post: Grant ,state,
+Current Project Period Start Date,Post: Grant ,grant_start_date,
+Current Project Period End Date,Post: Grant ,grant_end_date,
+Project Director - Name,User,display_name,
+Project Director - Email,User,user_email,use the name portion of the email address as the user_login
+Project Director - Phone,User,ACF field: contact_phone,
+Project Officer - Name,User,display_name,See userrolemapping.csv
+Project Officer - Email,User,user_email,
+Project Officer - Phone,User,ACF field: contact_phone,
