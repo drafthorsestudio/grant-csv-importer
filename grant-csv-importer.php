@@ -1,8 +1,8 @@
 <?php
 /**
- * Plugin Name:BHWISE Grant CSV Importer
- * Description: Import grants and users from CSV files with mapping to custom post types and taxonomies
- * Version: 1.0.0
+ * Plugin Name: BHWISE Grant CSV Importer v2
+ * Description: Import grants and users from CSV files with bidirectional user-grant relationships
+ * Version: 2.0.1
  * Author: KC Web Programmers
  * Text Domain: grant-csv-importer
  */
@@ -12,7 +12,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-class Grant_CSV_Importer {
+class Grant_CSV_Importer_V2 {
     
     private $upload_dir;
     private $csv_data = [];
@@ -36,7 +36,7 @@ class Grant_CSV_Importer {
     }
     
     /**
-     * Add admin menu page
+     * Add admin menu page with tabs
      */
     public function add_admin_menu() {
         add_submenu_page(
@@ -57,7 +57,7 @@ class Grant_CSV_Importer {
             return;
         }
         
-        if (!wp_verify_nonce($_POST['grant_importer_nonce'], 'grant_importer_upload')) {
+        if (!wp_verify_nonce($_POST['grant_importer_nonce'], 'grant_importer_action')) {
             return;
         }
         
@@ -79,6 +79,11 @@ class Grant_CSV_Importer {
         if (isset($_POST['clear_import'])) {
             $this->clear_import_data();
         }
+        
+        // Handle sync relationships
+        if (isset($_POST['sync_relationships'])) {
+            $this->sync_all_relationships();
+        }
     }
     
     /**
@@ -87,14 +92,14 @@ class Grant_CSV_Importer {
     private function handle_csv_upload() {
         $file = $_FILES['csv_file'];
         
-        // Get selected group program term
-        $group_program_term = isset($_POST['group_program_term']) ? sanitize_text_field($_POST['group_program_term']) : '';
+        // Get selected grant program term
+        $grant_program_term = isset($_POST['grant_program_term']) ? sanitize_text_field($_POST['grant_program_term']) : '';
         
-        if (empty($group_program_term)) {
+        if (empty($grant_program_term)) {
             add_settings_error(
                 'grant_importer',
                 'missing_term',
-                'Please select a Group Program.',
+                'Please select a Grant Program.',
                 'error'
             );
             return;
@@ -140,7 +145,10 @@ class Grant_CSV_Importer {
                 'Current Project Period End Date',
                 'Project Director - Name',
                 'Project Director - Email',
-                'Project Director - Phone'
+                'Project Director - Phone',
+                'Project Officer - Name',
+                'Project Officer - Email',
+                'Project Officer - Phone'
             ];
             
             $first_row = reset($this->csv_data);
@@ -160,7 +168,7 @@ class Grant_CSV_Importer {
             // Store filename and selected term in transient for next step
             set_transient('grant_importer_csv_file', $filename, HOUR_IN_SECONDS);
             set_transient('grant_importer_csv_data', $this->csv_data, HOUR_IN_SECONDS);
-            set_transient('grant_importer_group_program', $group_program_term, HOUR_IN_SECONDS);
+            set_transient('grant_importer_grant_program', $grant_program_term, HOUR_IN_SECONDS);
             
             add_settings_error(
                 'grant_importer',
@@ -186,16 +194,7 @@ class Grant_CSV_Importer {
         delete_transient('grant_importer_csv_file');
         delete_transient('grant_importer_csv_data');
         delete_transient('grant_importer_results');
-        delete_transient('grant_importer_group_program');
-        
-        // Optionally delete uploaded CSV files from directory
-        // Uncomment if you want to clean up old files
-        // $files = glob($this->upload_dir . 'grant_import_*.csv');
-        // foreach ($files as $file) {
-        //     if (is_file($file)) {
-        //         unlink($file);
-        //     }
-        // }
+        delete_transient('grant_importer_grant_program');
         
         add_settings_error(
             'grant_importer',
@@ -264,9 +263,9 @@ class Grant_CSV_Importer {
         $csv_filename = sanitize_text_field($_POST['csv_filename']);
         $import_count = sanitize_text_field($_POST['import_count']);
         
-        // Get CSV data and group program from transient
+        // Get CSV data and grant program from transient
         $csv_data = get_transient('grant_importer_csv_data');
-        $group_program_slug = get_transient('grant_importer_group_program');
+        $grant_program_slug = get_transient('grant_importer_grant_program');
         
         if (!$csv_data) {
             add_settings_error(
@@ -278,11 +277,11 @@ class Grant_CSV_Importer {
             return;
         }
         
-        if (!$group_program_slug) {
+        if (!$grant_program_slug) {
             add_settings_error(
                 'grant_importer',
                 'no_term',
-                'Group Program not found. Please upload the file again.',
+                'Grant Program not found. Please upload the file again.',
                 'error'
             );
             return;
@@ -299,14 +298,17 @@ class Grant_CSV_Importer {
         // Process imports
         $this->import_results = [
             'grants_created' => 0,
+            'grants_updated' => 0,
             'grants_skipped' => 0,
-            'users_created' => 0,
-            'users_skipped' => 0,
+            'directors_created' => 0,
+            'directors_updated' => 0,
+            'officers_created' => 0,
+            'officers_updated' => 0,
             'errors' => []
         ];
         
         foreach ($rows_to_import as $index => $row) {
-            $this->process_row($row, $index, $group_program_slug);
+            $this->process_row($row, $index, $grant_program_slug);
         }
         
         // Store results in transient
@@ -316,7 +318,7 @@ class Grant_CSV_Importer {
         if ($import_count === 'all') {
             delete_transient('grant_importer_csv_file');
             delete_transient('grant_importer_csv_data');
-            delete_transient('grant_importer_group_program');
+            delete_transient('grant_importer_grant_program');
         }
         
         // Redirect to avoid resubmission
@@ -327,33 +329,47 @@ class Grant_CSV_Importer {
     /**
      * Process a single CSV row
      */
-    private function process_row($row, $index, $group_program_slug) {
-        // Extract data from row
+    private function process_row($row, $index, $grant_program_slug) {
+        // Extract grant data from row
         $org_name = trim($row['Organization Name']);
         $grant_number = trim($row['Grant Number']);
         $city = trim($row['City']);
         $state = trim($row['State']);
         $start_date = $this->convert_date($row['Current Project Period Start Date']);
         $end_date = $this->convert_date($row['Current Project Period End Date']);
+        
+        // Extract Project Director data
         $pd_name = trim($row['Project Director - Name']);
         $pd_email = trim($row['Project Director - Email']);
         $pd_phone = trim($row['Project Director - Phone']);
+        $pd_phone_data = $this->parse_phone_number($pd_phone);
         
-        // Parse phone number
-        $phone_data = $this->parse_phone_number($pd_phone);
+        // Extract Project Officer data
+        $po_name = trim($row['Project Officer - Name']);
+        $po_email = trim($row['Project Officer - Email']);
+        $po_phone = trim($row['Project Officer - Phone']);
+        $po_phone_data = $this->parse_phone_number($po_phone);
         
-        // Map group program slug to user role
-        $user_role = $this->map_taxonomy_slug_to_role($group_program_slug);
+        // Map grant program slug to user roles
+        $director_role = $this->map_taxonomy_slug_to_director_role($grant_program_slug);
+        $officer_role = $this->map_taxonomy_slug_to_officer_role($grant_program_slug);
         
         // Check if grant already exists
         $existing_grant = $this->get_grant_by_number($grant_number);
         
         if ($existing_grant) {
-            $this->import_results['grants_skipped']++;
-            $grant_id = $existing_grant->ID;
+            // Update existing grant
+            $grant_id = $this->update_grant_post($existing_grant->ID, $org_name, $grant_number, $city, $state, $start_date, $end_date, $grant_program_slug);
+            
+            if (is_wp_error($grant_id)) {
+                $this->import_results['errors'][] = "Row " . ($index + 1) . ": Failed to update grant - " . $grant_id->get_error_message();
+                return;
+            }
+            
+            $this->import_results['grants_updated']++;
         } else {
-            // Create grant post
-            $grant_id = $this->create_grant_post($org_name, $grant_number, $city, $state, $start_date, $end_date, $pd_name, $pd_email, $phone_data, $group_program_slug);
+            // Create new grant post
+            $grant_id = $this->create_grant_post($org_name, $grant_number, $city, $state, $start_date, $end_date, $grant_program_slug);
             
             if (is_wp_error($grant_id)) {
                 $this->import_results['errors'][] = "Row " . ($index + 1) . ": Failed to create grant - " . $grant_id->get_error_message();
@@ -363,19 +379,66 @@ class Grant_CSV_Importer {
             $this->import_results['grants_created']++;
         }
         
-        // Check if user already exists
-        $existing_user = get_user_by('email', $pd_email);
+        // Handle Project Director user
+        $director_user = get_user_by('email', $pd_email);
         
-        if ($existing_user) {
-            $this->import_results['users_skipped']++;
+        if ($director_user) {
+            // Update existing director
+            $this->update_user($director_user->ID, $pd_name, $pd_phone_data, $director_role);
+            $this->import_results['directors_updated']++;
+            $director_id = $director_user->ID;
         } else {
-            // Create user
-            $user_id = $this->create_user($pd_name, $pd_email, $user_role);
+            // Create new director
+            $director_id = $this->create_user($pd_name, $pd_email, $pd_phone_data, $director_role);
             
-            if (is_wp_error($user_id)) {
-                $this->import_results['errors'][] = "Row " . ($index + 1) . ": Failed to create user - " . $user_id->get_error_message();
+            if (is_wp_error($director_id)) {
+                $this->import_results['errors'][] = "Row " . ($index + 1) . ": Failed to create director - " . $director_id->get_error_message();
             } else {
-                $this->import_results['users_created']++;
+                $this->import_results['directors_created']++;
+            }
+        }
+        
+        // Handle Project Officer user
+        $officer_user = get_user_by('email', $po_email);
+        
+        if ($officer_user) {
+            // Update existing officer
+            $this->update_user($officer_user->ID, $po_name, $po_phone_data, $officer_role);
+            $this->import_results['officers_updated']++;
+            $officer_id = $officer_user->ID;
+        } else {
+            // Create new officer
+            $officer_id = $this->create_user($po_name, $po_email, $po_phone_data, $officer_role);
+            
+            if (is_wp_error($officer_id)) {
+                $this->import_results['errors'][] = "Row " . ($index + 1) . ": Failed to create officer - " . $officer_id->get_error_message();
+            } else {
+                $this->import_results['officers_created']++;
+            }
+        }
+        
+        // Update grant-to-user relationships (sync function will handle the reverse)
+        if (!is_wp_error($director_id)) {
+            $current_directors = get_field('grant_to_director_relationship', $grant_id, false) ?: [];
+            if (!is_array($current_directors)) {
+                $current_directors = $current_directors ? [$current_directors] : [];
+            }
+            
+            if (!in_array($director_id, $current_directors)) {
+                $current_directors[] = $director_id;
+                update_field('grant_to_director_relationship', $current_directors, $grant_id);
+            }
+        }
+        
+        if (!is_wp_error($officer_id)) {
+            $current_officers = get_field('grant_to_officer_relationship', $grant_id, false) ?: [];
+            if (!is_array($current_officers)) {
+                $current_officers = $current_officers ? [$current_officers] : [];
+            }
+            
+            if (!in_array($officer_id, $current_officers)) {
+                $current_officers[] = $officer_id;
+                update_field('grant_to_officer_relationship', $current_officers, $grant_id);
             }
         }
     }
@@ -431,9 +494,9 @@ class Grant_CSV_Importer {
     }
     
     /**
-     * Map taxonomy slug to user role
+     * Map taxonomy slug to director role
      */
-    private function map_taxonomy_slug_to_role($taxonomy_slug) {
+    private function map_taxonomy_slug_to_director_role($taxonomy_slug) {
         $mapping = [
             'bhwet-para' => 'bhwet-para-user',
             'bhwet-pro' => 'bhwet-pro-user',
@@ -442,6 +505,23 @@ class Grant_CSV_Importer {
             'istp' => 'istp-user',
             'oifsp' => 'oifsp-user',
             'amf' => 'amf-user'
+        ];
+        
+        return isset($mapping[$taxonomy_slug]) ? $mapping[$taxonomy_slug] : 'subscriber';
+    }
+    
+    /**
+     * Map taxonomy slug to officer role
+     */
+    private function map_taxonomy_slug_to_officer_role($taxonomy_slug) {
+        $mapping = [
+            'bhwet-para' => 'bhwet-para-project-officer',
+            'bhwet-pro' => 'bhwet-pro-project-officer',
+            'bhwet-social' => 'bhwet-social-project-officer',
+            'gpe' => 'gpe-project-officer',
+            'istp' => 'istp-project-officer',
+            'oifsp' => 'oifsp-project-officer',
+            'amf' => 'amf-project-officer'
         ];
         
         return isset($mapping[$taxonomy_slug]) ? $mapping[$taxonomy_slug] : 'subscriber';
@@ -475,7 +555,7 @@ class Grant_CSV_Importer {
     /**
      * Create grant post
      */
-    private function create_grant_post($org_name, $grant_number, $city, $state, $start_date, $end_date, $pd_name, $pd_email, $phone_data, $taxonomy_slug) {
+    private function create_grant_post($org_name, $grant_number, $city, $state, $start_date, $end_date, $taxonomy_slug) {
         // Create post
         $post_data = [
             'post_title' => $org_name,
@@ -489,17 +569,15 @@ class Grant_CSV_Importer {
             return $post_id;
         }
         
-        // Set taxonomy term - using term slug
-        $term = get_term_by('slug', $taxonomy_slug, 'group-program');
+        // Set taxonomy term
+        $term = get_term_by('slug', $taxonomy_slug, 'grant-program');
         if ($term && !is_wp_error($term)) {
-            $result = wp_set_object_terms($post_id, (int)$term->term_id, 'group-program', false);
+            $result = wp_set_object_terms($post_id, (int)$term->term_id, 'grant-program', false);
             if (is_wp_error($result)) {
-                // Log error but continue with post creation
                 error_log("Grant Importer: Failed to set taxonomy term '{$taxonomy_slug}' for post {$post_id}: " . $result->get_error_message());
             }
         } else {
-            // Log that term wasn't found
-            error_log("Grant Importer: Taxonomy term '{$taxonomy_slug}' not found in 'group-program' taxonomy for post {$post_id}");
+            error_log("Grant Importer: Taxonomy term '{$taxonomy_slug}' not found in 'grant-program' taxonomy for post {$post_id}");
         }
         
         // Set ACF fields
@@ -508,13 +586,32 @@ class Grant_CSV_Importer {
         update_field('state', $state, $post_id);
         update_field('grant_start_date', $start_date, $post_id);
         update_field('grant_end_date', $end_date, $post_id);
-        update_field('contact_name', $pd_name, $post_id);
-        update_field('contact_email', $pd_email, $post_id);
-        update_field('contact_phone', $phone_data['phone'], $post_id);
         
-        if (!empty($phone_data['extension'])) {
-            update_field('contact_phone_extension', $phone_data['extension'], $post_id);
+        return $post_id;
+    }
+    
+    /**
+     * Update grant post
+     */
+    private function update_grant_post($post_id, $org_name, $grant_number, $city, $state, $start_date, $end_date, $taxonomy_slug) {
+        // Update post title
+        wp_update_post([
+            'ID' => $post_id,
+            'post_title' => $org_name
+        ]);
+        
+        // Update taxonomy term
+        $term = get_term_by('slug', $taxonomy_slug, 'grant-program');
+        if ($term && !is_wp_error($term)) {
+            wp_set_object_terms($post_id, (int)$term->term_id, 'grant-program', false);
         }
+        
+        // Update ACF fields
+        update_field('grant_number', $grant_number, $post_id);
+        update_field('city', $city, $post_id);
+        update_field('state', $state, $post_id);
+        update_field('grant_start_date', $start_date, $post_id);
+        update_field('grant_end_date', $end_date, $post_id);
         
         return $post_id;
     }
@@ -522,7 +619,7 @@ class Grant_CSV_Importer {
     /**
      * Create user
      */
-    private function create_user($full_name, $email, $role) {
+    private function create_user($full_name, $email, $phone_data, $role) {
         // Split name into first and last
         $name_parts = $this->split_name($full_name);
         
@@ -539,13 +636,52 @@ class Grant_CSV_Importer {
             'user_email' => $email,
             'first_name' => $name_parts['first_name'],
             'last_name' => $name_parts['last_name'],
+            'display_name' => $full_name,
             'role' => $role,
             'user_pass' => wp_generate_password(12, true, true)
         ];
         
         $user_id = wp_insert_user($user_data);
         
+        if (!is_wp_error($user_id)) {
+            // Set phone number ACF fields
+            update_field('user_phone_number', $phone_data['phone'], 'user_' . $user_id);
+            
+            if (!empty($phone_data['extension'])) {
+                update_field('user_phone_extension', $phone_data['extension'], 'user_' . $user_id);
+            }
+        }
+        
         return $user_id;
+    }
+    
+    /**
+     * Update user
+     */
+    private function update_user($user_id, $full_name, $phone_data, $role) {
+        // Split name into first and last
+        $name_parts = $this->split_name($full_name);
+        
+        // Update user data
+        wp_update_user([
+            'ID' => $user_id,
+            'first_name' => $name_parts['first_name'],
+            'last_name' => $name_parts['last_name'],
+            'display_name' => $full_name
+        ]);
+        
+        // Add role if user doesn't have it (don't remove existing roles)
+        $user = new WP_User($user_id);
+        if (!in_array($role, (array) $user->roles)) {
+            $user->add_role($role);
+        }
+        
+        // Update phone number ACF fields
+        update_field('user_phone_number', $phone_data['phone'], 'user_' . $user_id);
+        
+        if (!empty($phone_data['extension'])) {
+            update_field('user_phone_extension', $phone_data['extension'], 'user_' . $user_id);
+        }
     }
     
     /**
@@ -575,9 +711,120 @@ class Grant_CSV_Importer {
     }
     
     /**
+     * Sync all grant-user relationships (bidirectional)
+     */
+    private function sync_all_relationships() {
+        $synced_count = 0;
+        $errors = [];
+        
+        // PART 1: Sync from Grants to Users (Grant → User)
+        $grants = get_posts([
+            'post_type' => 'grant',
+            'posts_per_page' => -1,
+            'post_status' => 'publish'
+        ]);
+        
+        foreach ($grants as $grant) {
+            // Sync directors
+            $director_ids = get_field('grant_to_director_relationship', $grant->ID, false) ?: [];
+            if (!is_array($director_ids)) {
+                $director_ids = $director_ids ? [$director_ids] : [];
+            }
+            
+            foreach ($director_ids as $director_id) {
+                $director_grants = get_field('director_to_grant_relationship', 'user_' . $director_id, false) ?: [];
+                if (!is_array($director_grants)) {
+                    $director_grants = $director_grants ? [$director_grants] : [];
+                }
+                
+                if (!in_array($grant->ID, $director_grants)) {
+                    $director_grants[] = $grant->ID;
+                    update_field('director_to_grant_relationship', $director_grants, 'user_' . $director_id);
+                    $synced_count++;
+                }
+            }
+            
+            // Sync officers
+            $officer_ids = get_field('grant_to_officer_relationship', $grant->ID, false) ?: [];
+            if (!is_array($officer_ids)) {
+                $officer_ids = $officer_ids ? [$officer_ids] : [];
+            }
+            
+            foreach ($officer_ids as $officer_id) {
+                $officer_grants = get_field('officer_to_grant_relationship', 'user_' . $officer_id, false) ?: [];
+                if (!is_array($officer_grants)) {
+                    $officer_grants = $officer_grants ? [$officer_grants] : [];
+                }
+                
+                if (!in_array($grant->ID, $officer_grants)) {
+                    $officer_grants[] = $grant->ID;
+                    update_field('officer_to_grant_relationship', $officer_grants, 'user_' . $officer_id);
+                    $synced_count++;
+                }
+            }
+        }
+        
+        // PART 2: Sync from Users to Grants (User → Grant)
+        $users = get_users(['fields' => 'ID']);
+        
+        foreach ($users as $user_id) {
+            // Sync director grants
+            $director_grant_ids = get_field('director_to_grant_relationship', 'user_' . $user_id, false) ?: [];
+            if (!is_array($director_grant_ids)) {
+                $director_grant_ids = $director_grant_ids ? [$director_grant_ids] : [];
+            }
+            
+            foreach ($director_grant_ids as $grant_id) {
+                $grant_directors = get_field('grant_to_director_relationship', $grant_id, false) ?: [];
+                if (!is_array($grant_directors)) {
+                    $grant_directors = $grant_directors ? [$grant_directors] : [];
+                }
+                
+                if (!in_array($user_id, $grant_directors)) {
+                    $grant_directors[] = $user_id;
+                    update_field('grant_to_director_relationship', $grant_directors, $grant_id);
+                    $synced_count++;
+                }
+            }
+            
+            // Sync officer grants
+            $officer_grant_ids = get_field('officer_to_grant_relationship', 'user_' . $user_id, false) ?: [];
+            if (!is_array($officer_grant_ids)) {
+                $officer_grant_ids = $officer_grant_ids ? [$officer_grant_ids] : [];
+            }
+            
+            foreach ($officer_grant_ids as $grant_id) {
+                $grant_officers = get_field('grant_to_officer_relationship', $grant_id, false) ?: [];
+                if (!is_array($grant_officers)) {
+                    $grant_officers = $grant_officers ? [$grant_officers] : [];
+                }
+                
+                if (!in_array($user_id, $grant_officers)) {
+                    $grant_officers[] = $user_id;
+                    update_field('grant_to_officer_relationship', $grant_officers, $grant_id);
+                    $synced_count++;
+                }
+            }
+        }
+        
+        add_settings_error(
+            'grant_importer',
+            'sync_complete',
+            "Relationship sync complete. {$synced_count} relationships synchronized.",
+            'success'
+        );
+        
+        wp_redirect(admin_url('admin.php?page=grant-csv-importer&tab=sync'));
+        exit;
+    }
+    
+    /**
      * Render admin page
      */
     public function render_admin_page() {
+        // Get current tab
+        $current_tab = isset($_GET['tab']) ? sanitize_text_field($_GET['tab']) : 'import';
+        
         // Get CSV data from transient
         $csv_filename = get_transient('grant_importer_csv_file');
         $csv_data = get_transient('grant_importer_csv_data');
@@ -590,236 +837,345 @@ class Grant_CSV_Importer {
         
         ?>
         <div class="wrap">
-            <h1>Grant CSV Importer</h1>
+            <h1>Grant CSV Importer v2</h1>
+            
+            <!-- Tab Navigation -->
+            <h2 class="nav-tab-wrapper">
+                <a href="?post_type=grant&page=grant-csv-importer&tab=import" class="nav-tab <?php echo $current_tab === 'import' ? 'nav-tab-active' : ''; ?>">
+                    Import
+                </a>
+                <a href="?post_type=grant&page=grant-csv-importer&tab=sync" class="nav-tab <?php echo $current_tab === 'sync' ? 'nav-tab-active' : ''; ?>">
+                    Sync Relationships
+                </a>
+            </h2>
             
             <?php settings_errors('grant_importer'); ?>
             
-            <?php if ($import_results && isset($_GET['import_complete'])): ?>
-                <div class="notice notice-success">
-                    <h2>Import Complete</h2>
-                    <ul>
-                        <li><strong>Grants Created:</strong> <?php echo $import_results['grants_created']; ?></li>
-                        <li><strong>Grants Skipped (already exist):</strong> <?php echo $import_results['grants_skipped']; ?></li>
-                        <li><strong>Users Created:</strong> <?php echo $import_results['users_created']; ?></li>
-                        <li><strong>Users Skipped (already exist):</strong> <?php echo $import_results['users_skipped']; ?></li>
-                    </ul>
-                    
-                    <?php if (!empty($import_results['errors'])): ?>
-                        <h3>Errors:</h3>
-                        <ul>
-                            <?php foreach ($import_results['errors'] as $error): ?>
-                                <li style="color: red;"><?php echo esc_html($error); ?></li>
-                            <?php endforeach; ?>
-                        </ul>
-                    <?php endif; ?>
-                </div>
+            <?php if ($current_tab === 'import'): ?>
+                <?php $this->render_import_tab($csv_data, $csv_filename, $import_results); ?>
+            <?php elseif ($current_tab === 'sync'): ?>
+                <?php $this->render_sync_tab(); ?>
             <?php endif; ?>
-            
-            <?php if (!$csv_data): ?>
-                <!-- Step 1: Upload CSV -->
-                <div class="card" style="max-width: 800px;">
-                    <h2>Step 1: Upload CSV File</h2>
-                    <form method="post" enctype="multipart/form-data">
-                        <?php wp_nonce_field('grant_importer_upload', 'grant_importer_nonce'); ?>
-                        
-                        <table class="form-table">
-                            <tr>
-                                <th scope="row">
-                                    <label for="group_program_term">Group Program</label>
-                                </th>
-                                <td>
-                                    <select name="group_program_term" id="group_program_term" required style="min-width: 300px;">
-                                        <option value="">-- Select Group Program --</option>
-                                        <?php
-                                        $terms = get_terms([
-                                            'taxonomy' => 'group-program',
-                                            'hide_empty' => false,
-                                        ]);
-                                        
-                                        if (!is_wp_error($terms) && !empty($terms)):
-                                            foreach ($terms as $term):
-                                        ?>
-                                            <option value="<?php echo esc_attr($term->slug); ?>">
-                                                <?php echo esc_html($term->name); ?>
-                                            </option>
-                                        <?php 
-                                            endforeach;
-                                        else:
-                                        ?>
-                                            <option value="" disabled>No terms found - please create group-program taxonomy terms</option>
-                                        <?php endif; ?>
-                                    </select>
-                                    <p class="description">Select which Group Program these grants belong to. All imported grants will be assigned to this program.</p>
-                                </td>
-                            </tr>
-                            <tr>
-                                <th scope="row">
-                                    <label for="csv_file">CSV File</label>
-                                </th>
-                                <td>
-                                    <input type="file" name="csv_file" id="csv_file" accept=".csv" required>
-                                    <p class="description">Upload a CSV file with grant data.</p>
-                                </td>
-                            </tr>
-                        </table>
-                        
-                        <p class="submit">
-                            <input type="submit" name="upload_csv" class="button button-primary" value="Upload and Preview">
-                        </p>
-                    </form>
-                </div>
+        </div>
+        <?php
+    }
+    
+    /**
+     * Render Import Tab
+     */
+    private function render_import_tab($csv_data, $csv_filename, $import_results) {
+        ?>
+        <?php if ($import_results && isset($_GET['import_complete'])): ?>
+            <div class="notice notice-success">
+                <h2>Import Complete</h2>
+                <ul>
+                    <li><strong>Grants Created:</strong> <?php echo $import_results['grants_created']; ?></li>
+                    <li><strong>Grants Updated:</strong> <?php echo $import_results['grants_updated']; ?></li>
+                    <li><strong>Grants Skipped:</strong> <?php echo $import_results['grants_skipped']; ?></li>
+                    <li><strong>Directors Created:</strong> <?php echo $import_results['directors_created']; ?></li>
+                    <li><strong>Directors Updated:</strong> <?php echo $import_results['directors_updated']; ?></li>
+                    <li><strong>Officers Created:</strong> <?php echo $import_results['officers_created']; ?></li>
+                    <li><strong>Officers Updated:</strong> <?php echo $import_results['officers_updated']; ?></li>
+                </ul>
                 
-                <!-- Mapping Reference -->
-                <div class="card" style="max-width: 800px; margin-top: 20px;">
-                    <h2>Field Mapping Reference</h2>
-                    <table class="widefat">
+                <?php if (!empty($import_results['errors'])): ?>
+                    <h3>Errors:</h3>
+                    <ul>
+                        <?php foreach ($import_results['errors'] as $error): ?>
+                            <li style="color: red;"><?php echo esc_html($error); ?></li>
+                        <?php endforeach; ?>
+                    </ul>
+                <?php endif; ?>
+            </div>
+        <?php endif; ?>
+        
+        <?php if (!$csv_data): ?>
+            <!-- Step 1: Upload CSV -->
+            <div class="card" style="max-width: 800px;">
+                <h2>Step 1: Upload CSV File</h2>
+                <form method="post" enctype="multipart/form-data">
+                    <?php wp_nonce_field('grant_importer_action', 'grant_importer_nonce'); ?>
+                    
+                    <table class="form-table">
+                        <tr>
+                            <th scope="row">
+                                <label for="grant_program_term">Grant Program</label>
+                            </th>
+                            <td>
+                                <select name="grant_program_term" id="grant_program_term" required style="min-width: 300px;">
+                                    <option value="">-- Select Grant Program --</option>
+                                    <?php
+                                    $terms = get_terms([
+                                        'taxonomy' => 'grant-program',
+                                        'hide_empty' => false,
+                                    ]);
+                                    
+                                    if (!is_wp_error($terms) && !empty($terms)):
+                                        foreach ($terms as $term):
+                                    ?>
+                                        <option value="<?php echo esc_attr($term->slug); ?>">
+                                            <?php echo esc_html($term->name); ?>
+                                        </option>
+                                    <?php 
+                                        endforeach;
+                                    else:
+                                    ?>
+                                        <option value="" disabled>No terms found - please create grant-program taxonomy terms</option>
+                                    <?php endif; ?>
+                                </select>
+                                <p class="description">Select which Grant Program these grants belong to. All imported grants will be assigned to this program.</p>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th scope="row">
+                                <label for="csv_file">CSV File</label>
+                            </th>
+                            <td>
+                                <input type="file" name="csv_file" id="csv_file" accept=".csv" required>
+                                <p class="description">Upload a CSV file with grant data including both Project Directors and Project Officers.</p>
+                            </td>
+                        </tr>
+                    </table>
+                    
+                    <p class="submit">
+                        <input type="submit" name="upload_csv" class="button button-primary" value="Upload and Preview">
+                    </p>
+                </form>
+            </div>
+            
+            <!-- Mapping Reference -->
+            <div class="card" style="max-width: 800px; margin-top: 20px;">
+                <h2>Field Mapping Reference</h2>
+                <table class="widefat">
+                    <thead>
+                        <tr>
+                            <th>CSV Column</th>
+                            <th>Maps To</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><em>(Selected from dropdown)</em></td>
+                            <td>Grant Program Taxonomy</td>
+                        </tr>
+                        <tr>
+                            <td>Organization Name</td>
+                            <td>Grant Post Title</td>
+                        </tr>
+                        <tr>
+                            <td>Grant Number</td>
+                            <td>ACF Field: grant_number</td>
+                        </tr>
+                        <tr>
+                            <td>City</td>
+                            <td>ACF Field: city</td>
+                        </tr>
+                        <tr>
+                            <td>State</td>
+                            <td>ACF Field: state</td>
+                        </tr>
+                        <tr>
+                            <td>Current Project Period Start Date</td>
+                            <td>ACF Field: grant_start_date</td>
+                        </tr>
+                        <tr>
+                            <td>Current Project Period End Date</td>
+                            <td>ACF Field: grant_end_date</td>
+                        </tr>
+                        <tr>
+                            <td>Project Director - Name</td>
+                            <td>User: display_name, first_name, last_name + Grant Relationship</td>
+                        </tr>
+                        <tr>
+                            <td>Project Director - Email</td>
+                            <td>User: user_email, user_login</td>
+                        </tr>
+                        <tr>
+                            <td>Project Director - Phone</td>
+                            <td>User ACF Fields: user_phone_number, user_phone_extension</td>
+                        </tr>
+                        <tr>
+                            <td>Project Officer - Name</td>
+                            <td>User: display_name, first_name, last_name + Grant Relationship</td>
+                        </tr>
+                        <tr>
+                            <td>Project Officer - Email</td>
+                            <td>User: user_email, user_login</td>
+                        </tr>
+                        <tr>
+                            <td>Project Officer - Phone</td>
+                            <td>User ACF Fields: user_phone_number, user_phone_extension</td>
+                        </tr>
+                    </tbody>
+                </table>
+                
+                <h3 style="margin-top: 20px;">User Role Mapping</h3>
+                <table class="widefat">
+                    <thead>
+                        <tr>
+                            <th>Grant Program</th>
+                            <th>Director Role</th>
+                            <th>Officer Role</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr><td>BHWET Pro</td><td>bhwet-pro-user</td><td>bhwet-pro-project-officer</td></tr>
+                        <tr><td>BHWET Para</td><td>bhwet-para-user</td><td>bhwet-para-project-officer</td></tr>
+                        <tr><td>BHWET Social</td><td>bhwet-social-user</td><td>bhwet-social-project-officer</td></tr>
+                        <tr><td>GPE</td><td>gpe-user</td><td>gpe-project-officer</td></tr>
+                        <tr><td>ITSP</td><td>itsp-user</td><td>itsp-project-officer</td></tr>
+                        <tr><td>OIFSP</td><td>oifsp-user</td><td>oifsp-project-officer</td></tr>
+                        <tr><td>AMF</td><td>amf-user</td><td>amf-project-officer</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        
+        <?php else: ?>
+            <!-- Step 2: Review and Import -->
+            <div class="card" style="max-width: 1200px;">
+                <h2>Step 2: Review Data and Execute Import</h2>
+                
+                <?php 
+                $selected_term_slug = get_transient('grant_importer_grant_program');
+                $selected_term = get_term_by('slug', $selected_term_slug, 'grant-program');
+                ?>
+                
+                <p><strong>File:</strong> <?php echo esc_html($csv_filename); ?></p>
+                <p><strong>Grant Program:</strong> <?php echo $selected_term ? esc_html($selected_term->name) : esc_html($selected_term_slug); ?></p>
+                <p><strong>Total Rows:</strong> <?php echo count($csv_data); ?></p>
+                
+                <h3>Preview (First 5 Rows)</h3>
+                <div style="overflow-x: auto;">
+                    <table class="widefat striped">
                         <thead>
                             <tr>
-                                <th>CSV Column</th>
-                                <th>Maps To</th>
+                                <th>#</th>
+                                <th>Organization</th>
+                                <th>Grant Number</th>
+                                <th>City, State</th>
+                                <th>Project Director</th>
+                                <th>Project Officer</th>
                             </tr>
                         </thead>
                         <tbody>
+                            <?php 
+                            $preview_data = array_slice($csv_data, 0, 5);
+                            foreach ($preview_data as $index => $row): 
+                            ?>
                             <tr>
-                                <td><em>(Selected from dropdown)</em></td>
-                                <td>Group Program Taxonomy + User Role</td>
+                                <td><?php echo $index + 1; ?></td>
+                                <td><?php echo esc_html($row['Organization Name']); ?></td>
+                                <td><?php echo esc_html($row['Grant Number']); ?></td>
+                                <td><?php echo esc_html($row['City'] . ', ' . $row['State']); ?></td>
+                                <td><?php echo esc_html($row['Project Director - Name']); ?><br>
+                                    <small><?php echo esc_html($row['Project Director - Email']); ?></small>
+                                </td>
+                                <td><?php echo esc_html($row['Project Officer - Name']); ?><br>
+                                    <small><?php echo esc_html($row['Project Officer - Email']); ?></small>
+                                </td>
                             </tr>
-                            <tr>
-                                <td>Organization Name</td>
-                                <td>Grant Post Title</td>
-                            </tr>
-                            <tr>
-                                <td>Grant Number</td>
-                                <td>ACF Field: grant_number</td>
-                            </tr>
-                            <tr>
-                                <td>City</td>
-                                <td>ACF Field: city</td>
-                            </tr>
-                            <tr>
-                                <td>State</td>
-                                <td>ACF Field: state</td>
-                            </tr>
-                            <tr>
-                                <td>Current Project Period Start Date</td>
-                                <td>ACF Field: grant_start_date</td>
-                            </tr>
-                            <tr>
-                                <td>Current Project Period End Date</td>
-                                <td>ACF Field: grant_end_date</td>
-                            </tr>
-                            <tr>
-                                <td>Project Director - Name</td>
-                                <td>ACF Field: contact_name + User First/Last Name</td>
-                            </tr>
-                            <tr>
-                                <td>Project Director - Email</td>
-                                <td>ACF Field: contact_email + User Login/Email</td>
-                            </tr>
-                            <tr>
-                                <td>Project Director - Phone</td>
-                                <td>ACF Fields: contact_phone + contact_phone_extension</td>
-                            </tr>
+                            <?php endforeach; ?>
                         </tbody>
                     </table>
                 </div>
-            
-            <?php else: ?>
-                <!-- Step 2: Review and Import -->
-                <div class="card" style="max-width: 1200px;">
-                    <h2>Step 2: Review Data and Execute Import</h2>
+                
+                <form method="post" style="margin-top: 20px;">
+                    <?php wp_nonce_field('grant_importer_action', 'grant_importer_nonce'); ?>
+                    <input type="hidden" name="csv_filename" value="<?php echo esc_attr($csv_filename); ?>">
                     
-                    <?php 
-                    $selected_term_slug = get_transient('grant_importer_group_program');
-                    $selected_term = get_term_by('slug', $selected_term_slug, 'group-program');
-                    ?>
+                    <h3>Import Options</h3>
+                    <p>Choose how many rows to import:</p>
                     
-                    <p><strong>File:</strong> <?php echo esc_html($csv_filename); ?></p>
-                    <p><strong>Group Program:</strong> <?php echo $selected_term ? esc_html($selected_term->name) : esc_html($selected_term_slug); ?></p>
-                    <p><strong>Total Rows:</strong> <?php echo count($csv_data); ?></p>
-                    
-                    <h3>Preview (First 5 Rows)</h3>
-                    <div style="overflow-x: auto;">
-                        <table class="widefat striped">
-                            <thead>
-                                <tr>
-                                    <th>#</th>
-                                    <th>Organization</th>
-                                    <th>Grant Number</th>
-                                    <th>City, State</th>
-                                    <th>Project Director</th>
-                                    <th>Email</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                <?php 
-                                $preview_data = array_slice($csv_data, 0, 5);
-                                foreach ($preview_data as $index => $row): 
-                                ?>
-                                <tr>
-                                    <td><?php echo $index + 1; ?></td>
-                                    <td><?php echo esc_html($row['Organization Name']); ?></td>
-                                    <td><?php echo esc_html($row['Grant Number']); ?></td>
-                                    <td><?php echo esc_html($row['City'] . ', ' . $row['State']); ?></td>
-                                    <td><?php echo esc_html($row['Project Director - Name']); ?></td>
-                                    <td><?php echo esc_html($row['Project Director - Email']); ?></td>
-                                </tr>
-                                <?php endforeach; ?>
-                            </tbody>
-                        </table>
-                    </div>
-                    
-                    <form method="post" style="margin-top: 20px;">
-                        <?php wp_nonce_field('grant_importer_upload', 'grant_importer_nonce'); ?>
-                        <input type="hidden" name="csv_filename" value="<?php echo esc_attr($csv_filename); ?>">
+                    <p>
+                        <button type="submit" name="execute_import" value="1" class="button" 
+                                onclick="return confirm('Import 1 row for testing?');">
+                            Import 1 Row (Test)
+                        </button>
                         
-                        <h3>Import Options</h3>
-                        <p>Choose how many rows to import:</p>
+                        <button type="submit" name="execute_import" value="5" class="button" 
+                                onclick="return confirm('Import 5 rows for testing?');">
+                            Import 5 Rows (Test)
+                        </button>
                         
-                        <p>
-                            <button type="submit" name="execute_import" value="1" class="button" 
-                                    onclick="return confirm('Import 1 row for testing?');">
-                                Import 1 Row (Test)
-                            </button>
-                            
-                            <button type="submit" name="execute_import" value="5" class="button" 
-                                    onclick="return confirm('Import 5 rows for testing?');">
-                                Import 5 Rows (Test)
-                            </button>
-                            
-                            <button type="submit" name="execute_import" value="all" class="button button-primary" 
-                                    onclick="return confirm('Import all <?php echo count($csv_data); ?> rows? This action will create grants and users.');">
-                                Import All Rows (<?php echo count($csv_data); ?>)
-                            </button>
-                        </p>
-                        
-                        <input type="hidden" name="import_count" value="" id="import_count_field">
-                    </form>
+                        <button type="submit" name="execute_import" value="all" class="button button-primary" 
+                                onclick="return confirm('Import all <?php echo count($csv_data); ?> rows? This will create/update grants and users.');">
+                            Import All Rows (<?php echo count($csv_data); ?>)
+                        </button>
+                    </p>
                     
-                    <form method="post" style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #ddd;">
-                        <?php wp_nonce_field('grant_importer_upload', 'grant_importer_nonce'); ?>
-                        <p>
-                            <button type="submit" name="clear_import" class="button button-secondary" 
-                                    onclick="return confirm('Clear this CSV and start over? This will not delete any imported data, only reset the import tool.');">
-                                Clear and Start Over
-                            </button>
-                            <span class="description" style="margin-left: 10px;">Reset the import process to upload a new CSV file</span>
-                        </p>
-                    </form>
-                    
-                    <script>
-                    jQuery(document).ready(function($) {
-                        $('button[name="execute_import"]').on('click', function() {
-                            $('#import_count_field').val($(this).val());
-                        });
+                    <input type="hidden" name="import_count" value="" id="import_count_field">
+                </form>
+                
+                <form method="post" style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #ddd;">
+                    <?php wp_nonce_field('grant_importer_action', 'grant_importer_nonce'); ?>
+                    <p>
+                        <button type="submit" name="clear_import" class="button button-secondary" 
+                                onclick="return confirm('Clear this CSV and start over? This will not delete any imported data, only reset the import tool.');">
+                            Clear and Start Over
+                        </button>
+                        <span class="description" style="margin-left: 10px;">Reset the import process to upload a new CSV file</span>
+                    </p>
+                </form>
+                
+                <script>
+                jQuery(document).ready(function($) {
+                    $('button[name="execute_import"]').on('click', function() {
+                        $('#import_count_field').val($(this).val());
                     });
-                    </script>
-                </div>
-            <?php endif; ?>
+                });
+                </script>
+            </div>
+        <?php endif; ?>
+        <?php
+    }
+    
+    /**
+     * Render Sync Tab
+     */
+    private function render_sync_tab() {
+        ?>
+        <div class="card" style="max-width: 800px;">
+            <h2>Sync Grant-User Relationships</h2>
+            <p>This tool will synchronize all bidirectional relationships between grants and users.</p>
+            <p>It will ensure that:</p>
+            <ul>
+                <li>If a grant has a director assigned, that director's user profile will list the grant</li>
+                <li>If a grant has an officer assigned, that officer's user profile will list the grant</li>
+                <li>All existing relationships are properly synchronized in both directions</li>
+            </ul>
+            
+            <p><strong>When to use this:</strong></p>
+            <ul>
+                <li>After importing grants via CSV</li>
+                <li>After manually assigning users to grants (or vice versa)</li>
+                <li>If you notice relationships are missing from user profiles</li>
+            </ul>
+            
+            <form method="post">
+                <?php wp_nonce_field('grant_importer_action', 'grant_importer_nonce'); ?>
+                <p class="submit">
+                    <button type="submit" name="sync_relationships" class="button button-primary" 
+                            onclick="return confirm('Sync all grant-user relationships? This is safe to run multiple times.');">
+                        Sync All Relationships
+                    </button>
+                </p>
+            </form>
+        </div>
+        
+        <div class="card" style="max-width: 800px; margin-top: 20px;">
+            <h2>How Bidirectional Sync Works</h2>
+            <p>The synchronization process works as follows:</p>
+            <ol>
+                <li><strong>Grant → User (Director):</strong> When you assign a director to a grant via <code>grant_to_director_relationship</code>, the sync function automatically updates that user's <code>director_to_grant_relationship</code> field to include this grant.</li>
+                <li><strong>Grant → User (Officer):</strong> When you assign an officer to a grant via <code>grant_to_officer_relationship</code>, the sync function automatically updates that user's <code>officer_to_grant_relationship</code> field to include this grant.</li>
+                <li><strong>User → Grant:</strong> The same works in reverse - if you update a user's grant list, their grants will be updated to reference them.</li>
+            </ol>
+            
+            <p>The sync functions are triggered automatically when you save grants or user profiles, but this manual sync tool is useful for bulk operations or troubleshooting.</p>
         </div>
         <?php
     }
 }
 
 // Initialize plugin
-new Grant_CSV_Importer();
+new Grant_CSV_Importer_V2();

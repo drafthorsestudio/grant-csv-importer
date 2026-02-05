@@ -4,6 +4,7 @@ Program Name,Taxonomy: Grant Program,Term,see taxonomymapping.csv
 Organization Name,Post: Grant ,title,
 City,Post: Grant ,city,
 State,Post: Grant ,state,
+Zip Code,Post: Grant ,zip_code,
 Current Project Period Start Date,Post: Grant ,grant_start_date,
 Current Project Period End Date,Post: Grant ,grant_end_date,
 Project Director - Name,User,display_name,
